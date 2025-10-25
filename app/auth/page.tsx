@@ -58,7 +58,6 @@ const AUTH_SCOPE = 'daaid.app';
 const APP_NAME = 'DAAID';
 const SESSION_DURATION = 3600; // 1 hour
 
-const DEFAULT_PROTOCOL = process.env.NEXT_PUBLIC_NITROLITE_PROTOCOL || 'nitrolite-rpc';
 const DEFAULT_WEIGHTS = [100, 0];
 const DEFAULT_QUORUM = 100;
 
@@ -85,7 +84,7 @@ export default function App() {
     const [closeSessionId, setCloseSessionId] = useState<string>('');
     const [, setCloseResult] = useState<string>('');
 
-    const [appStateValue] = useState<string>("{\"counter\":1}");
+    const [appStateValue, setAppStateValue] = useState<string>("{\"counter\":1}");
     const [, setSubmitStateResult] = useState<string>('');
     const [, setGetStateResult] = useState<string>('');
 
@@ -192,10 +191,6 @@ export default function App() {
         }
     };
 
-    const handleShowAd = () => {
-        setShowAd(true);
-    };
-
     async function ensureOpenSessionAfterAuth(): Promise<void> {
         if (!sessionKey || !account) return;
         return new Promise<void>(async (resolve) => {
@@ -243,6 +238,39 @@ export default function App() {
             }
         });
     }
+
+    const handleSubmitAppState = async () => {
+        if (!isAuthenticated || !sessionKey || !account) {
+            alert('Connect and authenticate first');
+            return;
+        }
+        if (!closeSessionId) {
+            alert('Enter an App Session ID');
+            return;
+        }
+        try {
+            setSubmitStateResult('Submitting app state...');
+            const signer = createECDSAMessageSigner(sessionKey.privateKey);
+
+            let statePayload: any = appStateValue;
+            try {
+                statePayload = JSON.parse(appStateValue);
+            } catch {
+                // keep as string if not valid JSON
+            }
+
+            const message = await createSubmitAppStateMessage(
+                signer,
+                {
+                    appSessionId: closeSessionId,
+                    state: statePayload,
+                } as any,
+            );
+            webSocketService.send(message);
+        } catch (e) {
+            setSubmitStateResult(`Error: ${(e as Error).message}`);
+        }
+    };
 
     useEffect(() => {
         const handleMessage = async (data: any) => {
@@ -472,9 +500,33 @@ export default function App() {
 
 
     return (
-       <>                           
+       <>
        {account ? (
-            <div>Connected: {formatAddress(account)}</div>
+            <div>
+                <div>Connected: {formatAddress(account)}</div>
+                <div style={{ marginTop: 12 }}>
+                    <button onClick={() => handleCreateAppSession()}>Create Session</button>
+                </div>
+                <div style={{ marginTop: 12 }}>
+                    <input
+                        placeholder="App Session ID"
+                        value={closeSessionId}
+                        onChange={(e) => setCloseSessionId(e.target.value)}
+                        style={{ width: '100%', maxWidth: 480 }}
+                    />
+                </div>
+                <div style={{ marginTop: 8 }}>
+                    <input
+                        placeholder='App State JSON or text'
+                        value={appStateValue}
+                        onChange={(e) => setAppStateValue(e.target.value)}
+                        style={{ width: '100%', maxWidth: 480 }}
+                    />
+                </div>
+                <div style={{ marginTop: 8 }}>
+                    <button onClick={handleSubmitAppState} disabled={!closeSessionId || !appStateValue}>Submit App State</button>
+                </div>
+            </div>
              ) : (
             <button onClick={connectWallet}>
                 Authenticate
