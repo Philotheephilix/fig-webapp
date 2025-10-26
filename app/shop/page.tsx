@@ -1,7 +1,28 @@
 'use client'
-import { useState } from 'react';
-import { createWalletClient, custom, parseEther } from 'viem';
+import { useState, useEffect } from 'react';
+import { createWalletClient, custom, parseEther, type Address, type WalletClient } from 'viem';
 import { sepolia } from 'viem/chains';
+import {
+    createAuthRequestMessage,
+    createAuthVerifyMessage,
+    createEIP712AuthMessageSigner,
+    parseAnyRPCResponse,
+    RPCMethod,
+    type AuthChallengeResponse,
+    type AuthRequestParams,
+    createECDSAMessageSigner,
+    createTransferMessage,
+    type TransferRequestParams,
+} from '@erc7824/nitrolite';
+import { webSocketService, type WsStatus } from '../auth/lib/websocket';
+import {
+    generateSessionKey,
+    getStoredSessionKey,
+    storeSessionKey,
+    storeJWT,
+    removeJWT,
+    type SessionKey,
+} from '../auth/lib/utils';
 import BackgroundTerminal from '../components/BackgroundTerminal';
 import GlassNavbar from '../components/GlassNavbar';
 
@@ -10,6 +31,14 @@ declare global {
         ethereum?: any;
     }
 }
+
+const getAuthDomain = () => ({
+    name: 'DAAID',
+});
+
+const AUTH_SCOPE = 'daaid.app';
+const APP_NAME = 'DAAID';
+const SESSION_DURATION = 3600; // 1 hour
 
 const CREDIT_OPTIONS = [
     { credits: 500, price: '0.005', eth: '0.005' },
@@ -23,10 +52,119 @@ export default function ShopPage() {
     const [isModalOpen, setIsModalOpen] = useState(false);
     const [selectedOption, setSelectedOption] = useState<typeof CREDIT_OPTIONS[0] | null>(null);
     const [isProcessing, setIsProcessing] = useState(false);
-    const [walletClient, setWalletClient] = useState<any>(null);
+    const [walletClient, setWalletClient] = useState<WalletClient | null>(null);
     const [account, setAccount] = useState<`0x${string}` | null>(null);
     const [showSuccessModal, setShowSuccessModal] = useState(false);
     const [successMessage, setSuccessMessage] = useState('');
+    
+    // Authentication state
+    const [wsStatus, setWsStatus] = useState<WsStatus>('Disconnected');
+    const [sessionKey, setSessionKey] = useState<SessionKey | null>(null);
+    const [isAuthenticated, setIsAuthenticated] = useState(false);
+    const [isAuthAttempted, setIsAuthAttempted] = useState(false);
+    const [sessionExpireTimestamp, setSessionExpireTimestamp] = useState<string>('');
+
+    // Initialize session key and WebSocket connection
+    useEffect(() => {
+        const existingSessionKey = getStoredSessionKey();
+        if (existingSessionKey) {
+            setSessionKey(existingSessionKey);
+        } else {
+            const newSessionKey = generateSessionKey();
+            storeSessionKey(newSessionKey);
+            setSessionKey(newSessionKey);
+        }
+
+        webSocketService.addStatusListener(setWsStatus);
+        webSocketService.connect();
+
+        return () => {
+            webSocketService.removeStatusListener(setWsStatus);
+        };
+    }, []);
+
+    // Auto-authenticate when wallet is connected
+    useEffect(() => {
+        if (account && sessionKey && wsStatus === 'Connected' && !isAuthenticated && !isAuthAttempted) {
+            setIsAuthAttempted(true);
+
+            const expireTimestamp = String(Math.floor(Date.now() / 1000) + SESSION_DURATION);
+            setSessionExpireTimestamp(expireTimestamp);
+
+            const authParams: AuthRequestParams = {
+                address: account,
+                session_key: sessionKey.address,
+                app_name: APP_NAME,
+                expire: expireTimestamp,
+                scope: AUTH_SCOPE,
+                application: account,
+                allowances: [],
+            };
+
+            createAuthRequestMessage(authParams).then((payload) => {
+                webSocketService.send(payload);
+            });
+        }
+    }, [account, sessionKey, wsStatus, isAuthenticated, isAuthAttempted]);
+
+    // Handle WebSocket messages
+    useEffect(() => {
+        const handleMessage = async (data: any) => {
+            let response;
+            try {
+                response = parseAnyRPCResponse(JSON.stringify(data));
+            } catch (error) {
+                console.log('Ignoring RPC parsing error:', (error as Error).message);
+                return;
+            }
+
+            console.log('Received WebSocket message:', response.method, response);
+
+            if (
+                response.method === RPCMethod.AuthChallenge &&
+                walletClient &&
+                sessionKey &&
+                account &&
+                sessionExpireTimestamp
+            ) {
+                const challengeResponse = response as AuthChallengeResponse;
+
+                const authParams = {
+                    scope: AUTH_SCOPE,
+                    application: walletClient.account?.address as `0x${string}`,
+                    participant: sessionKey.address as `0x${string}`,
+                    expire: sessionExpireTimestamp,
+                    allowances: [],
+                };
+
+                const eip712Signer = createEIP712AuthMessageSigner(walletClient as any, authParams, getAuthDomain());
+
+                try {
+                    const authVerifyPayload = await createAuthVerifyMessage(eip712Signer, challengeResponse);
+                    webSocketService.send(authVerifyPayload);
+                } catch (error) {
+                    alert('Signature rejected. Please try again.');
+                    setIsAuthAttempted(false);
+                }
+            }
+
+            if (response.method === RPCMethod.AuthVerify && response.params?.success) {
+                setIsAuthenticated(true);
+                if (response.params.jwtToken) storeJWT(response.params.jwtToken);
+            }
+
+            // Handle errors
+            if (response.method === RPCMethod.Error) {
+                console.error('RPC Error:', response.params);
+                removeJWT();
+                alert(`Error: ${response.params.error}`);
+                setIsAuthAttempted(false);
+            }
+        };
+
+        webSocketService.addMessageListener(handleMessage);
+        return () => webSocketService.removeMessageListener(handleMessage);
+    }, [walletClient, sessionKey, sessionExpireTimestamp, account]);
 
     const connectWallet = async () => {
         if (!window.ethereum) {
@@ -47,7 +185,7 @@ export default function ShopPage() {
             }
 
             const walletClient = createWalletClient({
-                account: address,
+                account: address as `0x${string}`,
                 chain: sepolia,
                 transport: custom(window.ethereum),
             });
@@ -57,6 +195,41 @@ export default function ShopPage() {
         } catch (error) {
             console.error('Wallet connection failed:', error);
             alert('Failed to connect wallet. Please try again.');
+        }
+    };
+
+    // Server-side Nitrolite transfer function
+    const createServerNitroliteTransfer = async (toAccount: string, amount: string, asset: string = 'FIG') => {
+        console.log('💰 Creating server-side Nitrolite transfer...', {
+            to: toAccount,
+            amount,
+            asset
+        });
+
+        try {
+            const response = await fetch('/api/nitrolite-transfer', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    toAccount,
+                    amount,
+                    asset
+                }),
+            });
+
+            const result = await response.json();
+            
+            if (response.ok) {
+                console.log('✅ Server transfer initiated:', result);
+                return true;
+            } else {
+                throw new Error(result.error || 'Server transfer failed');
+            }
+        } catch (error) {
+            console.error('❌ Error creating server transfer:', error);
+            throw error;
         }
     };
 
@@ -70,18 +243,27 @@ export default function ShopPage() {
     };
 
     const executePurchase = async () => {
-        if (!walletClient || !selectedOption) return;
+        if (!walletClient || !selectedOption || !account) return;
 
         setIsProcessing(true);
         try {
+            // Step 1: Send ETH transaction on Sepolia
             const txHash = await walletClient.sendTransaction({
                 to: RECIPIENT_ADDRESS,
                 value: parseEther(selectedOption.eth),
-            });
+            } as any);
 
-            console.log('Transaction sent:', txHash);
+            console.log('ETH Transaction sent:', txHash);
 
-            // Call the claim API
+            // Step 2: Create server-side Nitrolite transfer from server to user
+            try {
+                await createServerNitroliteTransfer(account, selectedOption.credits.toString(), 'FIG');
+                console.log('✅ Server Nitrolite transfer initiated');
+            } catch (nitroliteError) {
+                console.warn('Server Nitrolite transfer failed, but continuing with claim API:', nitroliteError);
+            }
+
+            // Step 3: Call the claim API for token minting
             const response = await fetch('/api/claim', {
                 method: 'POST',
                 headers: {
@@ -105,7 +287,7 @@ export default function ShopPage() {
             }
         } catch (error) {
             console.error('Purchase failed:', error);
-            alert('Purchase failed. Please try again.');
+            alert(`Purchase failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         } finally {
             setIsProcessing(false);
         }
@@ -327,6 +509,9 @@ export default function ShopPage() {
                             <div>
                                 <div style={{ marginBottom: '1rem', fontSize: '0.9rem', opacity: 0.8, color: '#A7EF9E' }}>
                                     Connected: {account.slice(0, 6)}...{account.slice(-4)}
+                                </div>
+                                <div style={{ marginBottom: '1rem', fontSize: '0.8rem', opacity: 0.7, color: '#A7EF9E' }}>
+                                    WebSocket: {wsStatus} | Auth: {isAuthenticated ? '✅' : '⏳'}
                                 </div>
                             </div>
                         )}
